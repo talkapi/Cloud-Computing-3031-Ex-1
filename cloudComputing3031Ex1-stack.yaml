@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template to deploy a Lambda function and a DynamoDB table
+
+Resources:
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LambdaDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:DeleteItem'
+                Resource: '*'
+
+  DynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: 'cloud-computing-3031-ex1'
+      AttributeDefinitions:
+        - AttributeName: 'ticket_id'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'ticket_id'
+          KeyType: 'HASH'
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'ParkingLotLambda'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt [LambdaExecutionRole, Arn]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          from datetime import datetime, timezone
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('cloud-computing-3031-ex1')
+
+          def generate_ticket_id():
+              return f"{random.randint(10000, 99999)}"
+
+          def calculate_charge(minutes_parked):
+              rate_per_hour = 10.0
+              rate_per_15_min = rate_per_hour / 4
+              total_charge = ((minutes_parked + 15) // 15) * rate_per_15_min
+              return round(total_charge, 2)
+
+          def entry(event, context):
+              license_plate = event['queryStringParameters']['plate']
+              parking_lot = event['queryStringParameters']['parkingLot']
+
+              ticket_id = generate_ticket_id()
+              record_time = datetime.now(timezone.utc).isoformat()
+
+              table.put_item(
+                  Item={
+                      'ticket_id': ticket_id,
+                      'record_time': record_time,
+                      'parking_lot': parking_lot,
+                      'license_plate': license_plate
+                  }
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'ticket_id': ticket_id})
+              }
+
+          def exit(event, context):
+              ticket_id = event['queryStringParameters']['ticketId']
+
+              response = table.get_item(
+                  Key={'ticket_id': ticket_id}
+              )
+
+              if 'Item' not in response:
+                  return {
+                      'statusCode': 404,
+                      'body': json.dumps({'error': 'Ticket ID not found'})
+                  }
+
+              item = response['Item']
+              record_time = datetime.fromisoformat(item['record_time'])
+              current_time = datetime.now(timezone.utc)
+
+              parked_minutes = (current_time - record_time).total_seconds() / 60
+              total_charge = calculate_charge(parked_minutes)
+
+              # Delete the record from the database
+              table.delete_item(
+                  Key={'ticket_id': ticket_id}
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'license_plate': item['license_plate'],
+                      'total_parked_minutes': round(parked_minutes),
+                      'parking_lot': item['parking_lot'],
+                      'charge': total_charge
+                  })
+              }
+
+          def lambda_handler(event, context):
+              print('event')
+              route = event['resource']
+              if route == '/entry':
+                  return entry(event, context)
+              elif route == '/exit':
+                  return exit(event, context)
+              else:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'Unsupported route'})
+                  }
+
+      Runtime: 'python3.9'
+      Environment:
+        Variables:
+          TABLE_NAME: 'cloud-computing-3031-ex1'
+
+  ApiGatewayRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: 'ParkingLotApi'
+
+  ApiGatewayResourceEntry:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt [ApiGatewayRestApi, RootResourceId]
+      PathPart: 'entry'
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayResourceExit:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt [ApiGatewayRestApi, RootResourceId]
+      PathPart: 'exit'
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayMethodEntry:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: 'NONE'
+      HttpMethod: 'POST'
+      ResourceId: !Ref ApiGatewayResourceEntry
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: 'POST'
+        Type: 'AWS_PROXY'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction.Arn}/invocations'
+
+  ApiGatewayMethodExit:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: 'NONE'
+      HttpMethod: 'POST'
+      ResourceId: !Ref ApiGatewayResourceExit
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: 'POST'
+        Type: 'AWS_PROXY'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction.Arn}/invocations'
+
+  LambdaApiGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref LambdaFunction
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*'
+
+  ApiGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: 
+      - ApiGatewayMethodEntry
+      - ApiGatewayMethodExit
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: 'prod'
+
+Outputs:
+  ApiUrl:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
